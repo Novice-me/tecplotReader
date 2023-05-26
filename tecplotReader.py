@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 '''Python script to load Tecplot binary file or gzipped binary file'''
 __author__ = "Han Luo"
-__copyright__ = "Copyright 2022, Han Luo"
+__copyright__ = "Copyright 2023, Han Luo"
 __license__ = "GPL"
-__version__ = "3.0.0"
+__version__ = "4.2.0"
 __maintainer__ = "Han Luo"
 __email__ = "aGFuLmx1b0BnbWFpbC5jb20="
 
@@ -14,13 +14,16 @@ import functools
 import operator
 import gzip
 import logging
+import sys
 from construct import Int8ul as Byte
 from construct import Int16sl as Short
 from construct import Int32sl as Int
 from construct import Float32l as Float
 from construct import Float64l as Double
 from construct import Bit
-from construct import Struct, Array, Const, this, GreedyRange, If, Index, RepeatUntil, Computed, Default, Rebuild, Check, len_, Tell, Peek
+from construct import Struct, Array, Const, this, GreedyRange, If, Index, Computed, Default, Rebuild, Check, len_, Tell, Peek
+from construct import IfThenElse, Error, StopIf
+from construct.lib.containers import ListContainer
 from io import SEEK_CUR
 
 
@@ -53,6 +56,9 @@ class TecplotString(construct.Adapter):
         return dict(type="strz", encoding="ascii")
 
 
+TecStr = TecplotString()
+
+
 def squeeze_ijk(ijk, d_ijk=None):
     if d_ijk is None:
         d_ijk = ijk
@@ -64,6 +70,7 @@ def squeeze_ijk(ijk, d_ijk=None):
 
 class TecplotMatrix(construct.Construct):
     """Matrix"""
+
     def __init__(self, subcon, cell_centered=False, ijk=None, discard=False):
         super().__init__()
         self.name = "TecplotMatrix"
@@ -189,15 +196,14 @@ class TecplotMatrix(construct.Construct):
             return mdata.reshape(npshape)
 
     def _build(self, obj: np.ndarray, stream, context, path):
-        dtype = self.dtype
-        if 'dtype' in context:
-            dtype = context.dtype
-        if dtype is None:
-            dtype = obj.dtype
-        obj = obj.astype(dtype)
+        subcon = self.subcon
+        if callable(subcon):
+            subcon = subcon(context)
+        dtype = np.dtype(subcon.fmtstr)
+        obj = np.array(obj).astype(dtype)
         cell_centered = self.cell_centered
-        if 'cell_centered' in context._params:
-            cell_centered = context.cell_centered
+        if callable(cell_centered):
+            cell_centered = cell_centered(context)
         discard = self.discard
         if 'discard' in context:
             discard = context.discard
@@ -280,114 +286,167 @@ def aux_parse(x, lst, ctx):
     return False
 
 
-def generate_struct(read_data=True):
-    tec_str = TecplotString()
-    struct_file_header = Struct(
-        Const(b"#!TDV112"),  # Magic number
-        Const(Int.build(1)),  # Integer value of 1
-        Const(Int.build(0)),  # FileType: 0 = FULL
-        "title" / Default(tec_str, ""),  # File Title
-        "nvar" / Rebuild(Int, len_(this.variables)),  # Number of variables
-        "variables" / Array(this.nvar, tec_str),  # Variable names
-        "__integrity1__" / Check(this.nvar == len_(this.variables)),
-        "zones" / GreedyRange(
-            Struct(
-                "offset_start" / Tell,
-                "izone" / Index,
-                Const(Float.build(299.0)),  # Zone marker
-                "title" / Default(tec_str, ""),  # Zone name
-                Const(Int.build(-1)),  # Parent Zone
-                "time_strand" / Default(Int, -2),  # StrandID
-                "solution_time" / Default(Double, 0.0),  # Solution Time
-                Const(Int.build(-1)),  # Default Zone Color
-                "zone_type" / Int,  # Zone Type
-                "has_var_loc" / Default(Int, 1),  # Var Location = 1
-                "var_loc" / Default(If(this.has_var_loc == 1, Array(this._root.nvar, Int)), [VarLoc.Node] * this._root.nvar),  # Var Loc * nvar_file
-                Const(Int.build(0)),  # raw local 1-to-1
-                Const(Int.build(0)),  # mcs user-defined face = 0,
-                "ijk" / Default(If(this.zone_type == ZoneType.ORDERED, Array(3, Int)), None),
-                "num_pts" / Default(If(this.zone_type != ZoneType.ORDERED, Int), None),
-                "num_faces" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
-                "face_nodes" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
-                "boundary_faces" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
-                "boundary_connections" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
-                "num_elems" / Default(If(this.zone_type != ZoneType.ORDERED, Int), None),
-                "cell_dim" / Default(If(this.zone_type != 0, Array(3, Int)), None),
-                "__integrity2__" / Check(lambda this: bool(this.ijk is None) != bool(this.num_elems is None)),
-                "_has_aux_var" / Default(Int, 0),
-                "aux_vars" / Default(If(
-                    lambda this: this._has_aux_var == 1,
-                    RepeatUntil(
-                        lambda x, lst, ctx: 'has_next' not in x or x.has_next == 0,
-                        Struct(
-                            "name" / tec_str,
-                            "format" / Default(Int, 0),
-                            "value" / tec_str,
-                            "has_next" / Default(Int, lambda this: 0 if this._index + 1 == len(this._.aux_vars) else 1),
-                        ),
-                    )), None),
-                "offset_end" / Tell,
+# ===================== Tecplot Sections ======================
+
+TecHeader = Struct(
+    Const(b"#!TDV112"),  # Magic number
+    Const(Int.build(1)),  # Integer value of 1
+    Const(Int.build(0)),  # FileType: 0 = FULL
+    "title" / Default(TecStr, ""),  # File Title
+    "nvar" / Rebuild(Int, len_(this.variables)),  # Number of variables
+    "variables" / Array(this.nvar, TecStr),  # Variable names
+)
+
+TecDatasetAux = Struct(
+    Const(Float.build(799.0)),
+    "name" / TecStr,  # Variable names
+    Const(Int.build(0)),
+    "value" / TecStr,
+)
+
+TecGeom = Struct(
+    Const(Float.build(399.0)),
+    "igeom" / Index,
+    "position_coord_sys" / Default(Int, 0),
+    "scope" / Default(Int, 0),
+    "draw_order" / Default(Int, 0),
+    "x0" / Default(Double, 0.0),
+    "y0" / Default(Double, 0.0),
+    "z0" / Default(Double, 0.0),
+    "zone" / Default(Int, 0),
+    "color" / Default(Int, -1),
+    "fill_color" / Default(Int, -1),
+    "is_filled" / Default(Int, 0),
+    "type" / Default(Int, 0),
+    "line_pattern" / Default(Int, 0),
+    "pattern_length" / Default(Double, 0),  # GUI's value divided by 100
+    "line_thickness" / Default(Double, 0.04),  # GUI's value divided by 100
+    "num_ellipse_pts" / Default(Int, 72),
+    "arrow" / Default(
+        Struct(
+            "style" / Int,
+            "attachment" / Int,
+            "size" / Double,
+            "angle" / Double,  # GUI's value converted to radian
+            "macro_function" / TecStr,
+
+        ), dict(
+            stype=0,
+            attachment=0,
+            size=0.05,
+            angle=0.0,
+            macro_function="",
+            data_type=1,
+            clipping=0
+        )
+    ),
+    "data_type" / Default(Int, 1),  # 1=Float, 2=Double
+    "clipping" / Default(Int, 0),
+    "__integrity__" / Check(this.type == 0),
+    "geom" / IfThenElse(
+        this.type == 0,
+        Struct(
+            "num_polylines" / Rebuild(Int, len_(this.lines)),
+            "lines" / Array(
+                this.num_polylines,
+                Struct(
+                    "num_points" / Rebuild(Int, len_(this.x)),
+                    "x" / Array(this.num_points, IfThenElse(this._._.data_type == 1, Float, Double)),
+                    "y" / Array(this.num_points, IfThenElse(this._._.data_type == 1, Float, Double)),
+                    StopIf(this._._.position_coord_sys != 4),
+                    "z" / Array(this.num_points, IfThenElse(this._._.data_type == 1, Float, Double)),
+                )
             )
         ),
-        "nzones" / Computed(len_(this.zones)),
-        "_dataset_aux_magic" / Peek(Float),
-        "has_dataset_aux" / Computed(lambda this: this._dataset_aux_magic == 799.0),
-        "_dataset_aux" / If(this.has_dataset_aux, GreedyRange(
+        Error
+    )
+)
+
+
+def gen_zone_struct(nvar: int):
+    return Struct(
+        "offset_start" / Tell,
+        "izone" / Index,
+        Const(Float.build(299.0)),  # Zone marker
+        "title" / Default(TecStr, ""),  # Zone name
+        Const(Int.build(-1)),  # Parent Zone
+        "time_strand" / Default(Int, -2),  # StrandID
+        "solution_time" / Default(Double, 0.0),  # Solution Time
+        Const(Int.build(-1)),  # Default Zone Color
+        "zone_type" / Default(Int, ZoneType.ORDERED),  # Zone Type
+        "has_var_loc" / Default(Int, 1),  # Var Location = 1
+        "var_loc" / Default(If(this.has_var_loc == 1, Array(nvar, Int)), [VarLoc.Node] * nvar),  # Var Loc * nvar_file
+        Const(Int.build(0)),  # raw local 1-to-1
+        Const(Int.build(0)),  # mcs user-defined face = 0,
+        "ijk" / Default(If(this.zone_type == ZoneType.ORDERED, Array(3, Int)), None),
+        "num_pts" / Default(If(this.zone_type != ZoneType.ORDERED, Int), None),
+        "num_faces" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
+        "face_nodes" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
+        "boundary_faces" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
+        "boundary_connections" / Default(If(this.zone_type == ZoneType.FEPOLYGON or this.zone_type == ZoneType.FEPOLYHEDRON, Int), None),
+        "num_elems" / Default(If(this.zone_type != ZoneType.ORDERED, Int), None),
+        "cell_dim" / Default(If(this.zone_type != ZoneType.ORDERED, Array(3, Int)), None),
+        "__integrity__" / Check(lambda this: bool(this.ijk is None) != bool(this.num_elems is None)),
+        "aux_vars" / Default(GreedyRange(
             Struct(
-                Const(Float.build(799.0)),
-                "name" / tec_str,  # Variable names
-                Const(Int.build(0)),
-                "value" / tec_str,
-            )
-        )),
-        Const(Float.build(357.0)),
-        "data" / GreedyRange(
+                StopIf(Peek(Int) == 0),
+                Const(Int.build(1)),
+                "name" / TecStr,
+                "format" / Default(Int, 0),
+                "value" / TecStr,
+            ),
+        ), []),
+        Const(Int.build(0)),
+        "offset_end" / Tell,
+    )
+
+
+def gen_data_struct(variables, zone, read_data_=True):
+    nvar = len(variables)
+    return Struct(
+        "offset_start" / Tell,
+        "izone" / Index,
+        Const(Float.build(299.0)),
+        "data_type" / Default(Array(nvar, Int), [VarType.Float] * nvar),
+        "has_passive_var" / Default(Int, 1),
+        "passive_var" / Default(If(this.has_passive_var == 1, Array(nvar, Int)), [0] * nvar),
+        "has_shared_var" / Default(Int, 1),
+        "shared_var" / Default(If(this.has_shared_var == 1, Array(nvar, Int)), [-1] * nvar),
+        "shared_connectivity" / Default(Int, -1),
+        "ivar_zone" / Computed(lambda this: find_var_zone(this.has_passive_var, this.passive_var, this.has_shared_var, this.shared_var, nvar)),
+        "nvar_zone" / Computed(lambda this: len(this.ivar_zone)),
+        "min_max" / Array(this.nvar_zone, Array(2, Double)),
+        "data" / Array(
+            this.nvar_zone,
             Struct(
                 "offset_start" / Tell,
-                "izone" / Index,
-                Const(Float.build(299.0)),
-                "data_type" / Default(Array(this._root.nvar, Int), [VarType.Float] * this._root.nvar),
-                "has_passive_var" / Default(Int, 1),
-                "passive_var" / Default(If(this.has_passive_var == 1, Array(this._root.nvar, Int)), [0] * this._root.nvar),
-                "has_shared_var" / Default(Int, 1),
-                "shared_var" / Default(If(this.has_shared_var == 1, Array(this._root.nvar, Int)), [-1] * this._root.nvar),
-                "shared_connectivity" / Default(Int, -1),
-                "__integrity3__" / Check(this.shared_connectivity < this._root.nzones),
-                "ivar_zone" / Computed(lambda this: find_var_zone(this.has_passive_var, this.passive_var, this.has_shared_var, this.shared_var, this._root.nvar)),
-                "nvar_zone" / Computed(lambda this: len(this.ivar_zone)),
-                "min_max" / TecplotMatrix(Double, ijk=lambda this: [2, this.nvar_zone]),
-                "data" / RepeatUntil(
-                    lambda x, lst, ctx: len(lst) == ctx.nvar_zone,
-                    Struct(
-                        "offset_start" / Tell,
-                        "ivar" / Computed(lambda this: this._.ivar_zone[this._index]),
-                        "variable" / Computed(lambda this: this._root.variables[this.ivar]),
-                        "data_type" / Computed(lambda this: this._.data_type[this.ivar]),
-                        "izone" / Computed(lambda this: this._.izone),
-                        "varloc" / Computed(lambda this: this._root.zones[this.izone].var_loc[this.ivar] if this._root.zones[this.izone].has_var_loc == 1 else VarLoc.Node),
-                        "min" / Computed(lambda this: this._.min_max[0][this._index]),
-                        "max" / Computed(lambda this: this._.min_max[1][this._index]),
-                        "value" / TecplotMatrix(
-                            lambda this: VarTypeConstruct[this.data_type],
-                            cell_centered=lambda this: False if this._root.zones[this.izone].zone_type != ZoneType.ORDERED else this.varloc == VarLoc.CellCentered,
-                            ijk=lambda this: this._root.zones[this.izone].ijk if this._root.zones[this.izone].zone_type == ZoneType.ORDERED else [
-                                this._root.zones[this.izone].num_pts if this.varloc == VarLoc.Node else this._root.zones[this.izone].num_elems,
-                                1, 1],
-                            discard=bool(not read_data)
-                        ),
-                        "offset_end" / Tell
-                    )
+                "ivar" / Computed(lambda this: this._.ivar_zone[this._index]),
+                "variable" / Computed(lambda this: variables[this.ivar]),
+                "data_type" / Computed(lambda this: this._.data_type[this.ivar]),
+                "izone" / Computed(lambda this: this._.izone),
+                "varloc" / Computed(lambda this: zone.var_loc[this.ivar] if 'has_var_loc' in zone and zone.has_var_loc == 1 else VarLoc.Node),
+                "min" / Computed(lambda this: this._.min_max[this._index][0]),
+                "max" / Computed(lambda this: this._.min_max[this._index][1]),
+                "value" / TecplotMatrix(
+                    lambda this: VarTypeConstruct[this.data_type],
+                    cell_centered=lambda this: False if 'zone_type' not in zone or zone.zone_type != ZoneType.ORDERED else this.varloc == VarLoc.CellCentered,
+                    ijk=lambda this: zone.ijk if zone.zone_type == ZoneType.ORDERED else [
+                        zone.num_pts if this.varloc == VarLoc.Node else zone.num_elems,
+                        1, 1],
+                    discard=bool(not read_data_)
                 ),
                 "offset_end" / Tell
             )
         ),
+        "offset_end" / Tell
     )
-    return struct_file_header
 
 
 Logger = logging.getLogger(__name__)
 Logger.setLevel(logging.INFO)
-
+Handler = logging.StreamHandler(sys.stdout)
+Handler.setLevel(logging.INFO)
+Logger.addHandler(Handler)
 
 class TecplotFile(construct.Container):
     """
@@ -401,6 +460,8 @@ class TecplotFile(construct.Container):
         self.read_data = read_data
         self.compressed = False
         self.open = open
+        self.has_data = False
+
         with open(self.file, 'rb') as f:
             b = f.read(8)
             if b[:2] == b'\x1f\x8b':
@@ -408,14 +469,43 @@ class TecplotFile(construct.Container):
                 self.open = gzip.open
             elif b != b'#!TDV112':
                 raise ValueError(f'file {self.file} is not a valid Tecplot binary file')
-        subcon = generate_struct(self.read_data)
+
+        float_peek = Peek(Float)
         start_time = time.time()
         with self.open(self.file, 'rb') as f:
-            self.update(subcon.parse_stream(f))
-        Logger.warn(f"Finish loading {filePath:s} in {time.time() - start_time:f}(s)")
+            self.update(TecHeader.parse_stream(f))
+            reachingEOHM = False
+            self.has_dataset_aux = False
+            zone_struct = gen_zone_struct(self.nvar)
+            while not reachingEOHM:
+                marker = float_peek.parse_stream(f)
+                if marker == 399.0:
+                    Peek(TecGeom).parse_stream(f)
+                    self.geometries = GreedyRange(TecGeom).parse_stream(f)
+                elif marker == 299.0:
+                    Peek(zone_struct).parse_stream(f)
+                    self.zones = GreedyRange(zone_struct).parse_stream(f)
+                elif marker == 799.0:
+                    Peek(TecDatasetAux).parse_stream(f)
+                    self._dataset_aux = GreedyRange(TecDatasetAux).parse_stream(f)
+                    self.has_dataset_aux = True
+                elif marker == 357.0:
+                    Const(Float.build(357.0)).parse_stream(f)
+                    self.has_data = True
+                    break
+
+            self.nzones = len(self.zones)
+            self.data = ListContainer()
+            for iz, z in enumerate(self.zones):
+                self.data.append(gen_data_struct(self.variables, z, self.read_data).parse_stream(f))
+            if len(self.data) == 0:
+                raise ValueError("Fail to parse data")
+        Logger.warn(f"Finish loading {filePath:s} with {self.nzones} zones in {time.time() - start_time:f}(s)")
         if self.has_dataset_aux:
             self.dataset_aux = construct.Container()
             for i in self._dataset_aux:
+                if i.name in self.dataset_aux:
+                    raise ValueError(f'Duplicated dataset aux {i}')
                 if ',' in i.value:
                     self.dataset_aux[i.name] = i.value.split(',')
                 else:
@@ -498,7 +588,6 @@ if __name__ == "__main__":
 
     # get zone info
     print(tec.zones[0])
-
 
     # get data for first zone and first variable
     data = tec.get_data(0, 0)  # via API
